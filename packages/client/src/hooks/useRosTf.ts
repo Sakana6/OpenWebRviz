@@ -136,7 +136,7 @@ export function useRosTfTree(ros: ROSLIB.Ros | null, paused: boolean = false) {
   }, []);
 
   useEffect(() => {
-    if (!ros) {
+    if (!ros || paused) {
       setRobotPose(null);
       setTfVersion(0);
       tfCacheRef.current.clear();
@@ -147,6 +147,7 @@ export function useRosTfTree(ros: ROSLIB.Ros | null, paused: boolean = false) {
       ros,
       name: '/tf',
       messageType: 'tf2_msgs/msg/TFMessage',
+      throttle_rate: 200,
     });
 
     const tfStaticSub = new ROSLIB.Topic({
@@ -176,8 +177,6 @@ export function useRosTfTree(ros: ROSLIB.Ros | null, paused: boolean = false) {
     };
 
     const updateCache = (message: unknown) => {
-      if (paused) return;
-
       const tfMsg = message as { transforms: TfTransform[] };
       if (!tfMsg.transforms || tfMsg.transforms.length === 0) return;
 
