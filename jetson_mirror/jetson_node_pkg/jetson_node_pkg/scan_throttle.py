@@ -4,6 +4,9 @@ from collections import deque
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.qos import QoSProfile
+from rclpy.qos import ReliabilityPolicy
+from rclpy.qos import HistoryPolicy
 from sensor_msgs.msg import LaserScan
 
 
@@ -24,13 +27,18 @@ class ScanThrottle(Node):
         self.buffer = deque(maxlen=queue_size)
         self.last_published_stamp = None
         self.publish_period = 1.0 / output_rate_hz
+        qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+        )
 
-        self.publisher = self.create_publisher(LaserScan, output_topic, 10)
+        self.publisher = self.create_publisher(LaserScan, output_topic, qos)
         self.subscription = self.create_subscription(
             LaserScan,
             input_topic,
             self.handle_scan,
-            10,
+            qos,
         )
         self.timer = self.create_timer(self.publish_period, self.publish_latest)
 
