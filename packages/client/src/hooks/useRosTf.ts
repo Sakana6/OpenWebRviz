@@ -147,7 +147,6 @@ export function useRosTfTree(ros: ROSLIB.Ros | null, paused: boolean = false) {
       ros,
       name: '/tf',
       messageType: 'tf2_msgs/msg/TFMessage',
-      throttle_rate: 200,
     });
 
     const tfStaticSub = new ROSLIB.Topic({
