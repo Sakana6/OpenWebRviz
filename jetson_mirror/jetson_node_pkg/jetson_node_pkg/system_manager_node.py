@@ -443,17 +443,37 @@ class SystemManager(Node):
                 'ros2', 'run', 'nav2_map_server', 'map_saver_cli',
                 '-f', map_path,
                 '--ros-args',
-                '-p', 'save_map_timeout:=10.0',
+                '-p', 'save_map_timeout:=20.0',
                 '-p', 'map_subscribe_transient_local:=true',
             ]
-            result = subprocess.run(
-                self.build_ros_command(ros_args),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            result = None
+            attempts = 2
+            last_error = ''
+            for attempt in range(1, attempts + 1):
+                result = subprocess.run(
+                    self.build_ros_command(ros_args),
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                stderr = (result.stderr or '').strip()
+                stdout = (result.stdout or '').strip()
+                combined = '\n'.join(part for part in [stderr, stdout] if part).strip()
+                last_error = combined or f'rc={result.returncode}'
 
-            if result.returncode == 0:
+                if result.returncode == 0:
+                    break
+
+                if 'Failed to spin map subscription' in last_error and attempt < attempts:
+                    self.get_logger().warn(
+                        f'map_saver subscription was not ready on attempt {attempt}, retrying once...'
+                    )
+                    time.sleep(1.0)
+                    continue
+
+                break
+
+            if result and result.returncode == 0:
                 yaml_path = f'{map_path}.yaml'
                 pgm_path = f'{map_path}.pgm'
 
@@ -463,7 +483,7 @@ class SystemManager(Node):
                         map_list = self.build_map_list_payload()
                         upload_url = f'{upload_base_url}/api/maps/list'
                         self.get_logger().info(f'Uploading map list to {upload_url}...')
-                        upload_resp = requests.post(upload_url, json={'maps': map_list}, timeout=30)
+                        upload_resp = requests.post(upload_url, json={'maps': map_list}, timeout=15)
                         if upload_resp.status_code == 200:
                             self.get_logger().info('Map list uploaded successfully')
                         else:
@@ -478,7 +498,7 @@ class SystemManager(Node):
                     response.message = 'Map files not found after save'
             else:
                 response.success = False
-                response.message = f'map_saver failed: {result.stderr}'
+                response.message = f'map_saver failed: {last_error}'
         except subprocess.TimeoutExpired:
             response.success = False
             response.message = 'Map save timed out'

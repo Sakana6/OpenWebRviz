@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import base64
 import os
 import signal
 import shlex
 import subprocess
 import time
+from datetime import datetime, timezone
 
 import rclpy
 import requests
@@ -110,6 +110,7 @@ class SystemManager(Node):
         self.declare_parameter('cmd_vel_timeout_sec', 0.5)
         self.declare_parameter('cmd_vel_stop_period_sec', 0.2)
         self.declare_parameter('server_url', 'http://182.43.86.126:4001')
+        self.declare_parameter('cleanup_script', '/home/nvidia/webbot-cleanup-ros.sh')
 
         self.maps_dir = self.get_parameter('maps_dir').value
         self.slam_package = self.get_parameter('slam_package').value
@@ -119,6 +120,7 @@ class SystemManager(Node):
         self.stand_nav_launch_file = self.get_parameter('stand_nav_launch_file').value
         self.nav2_params_file = self.get_parameter('nav2_params_file').value
         self.slam_params_file = self.get_parameter('slam_params_file').value
+        self.cleanup_script = self.get_parameter('cleanup_script').value
         self.cmd_vel_timeout_sec = float(self.get_parameter('cmd_vel_timeout_sec').value)
         self.cmd_vel_stop_period_sec = float(self.get_parameter('cmd_vel_stop_period_sec').value)
 
@@ -154,6 +156,51 @@ class SystemManager(Node):
         self.create_service(Trigger, '/system/status', self.handle_status)
 
         self.get_logger().info('System Manager is ready.')
+
+    def cleanup_residual_processes(self):
+        cleanup_script = str(self.cleanup_script or '').strip()
+        if cleanup_script and os.path.exists(cleanup_script):
+            try:
+                subprocess.run(['/bin/bash', cleanup_script], capture_output=True, timeout=20)
+                return
+            except Exception as exc:
+                self.get_logger().warn(f'Cleanup script failed, falling back to pkill set: {exc}')
+
+        patterns = [
+            'mapping_all.launch.py',
+            'nav_all.launch.py',
+            'stand_nav_launch.py',
+            'slam_toolbox',
+            'async_slam_toolbox_node',
+            'online_async',
+            'fastlio_mapping',
+            'livox_ros_driver2',
+            'livox_ros_driver2_node',
+            'pointcloud_to_laserscan',
+            'pointcloud_to_laserscan_node',
+            'base_footprint_projector',
+            'cmd_vel_converter',
+            'stand_cmd_vel_converter',
+            'amcl',
+            'map_server',
+            'planner_server',
+            'controller_server',
+            'behavior_server',
+            'smoother_server',
+            'bt_navigator',
+            'lifecycle_manager',
+            'waypoint_follower',
+            'velocity_smoother',
+            'recoveries_server',
+            'robot_state_publisher',
+            'nav2_bringup',
+            'navigation_launch',
+            'gz sim',
+        ]
+        for sig in ('TERM', 'KILL'):
+            for pattern in patterns:
+                subprocess.run(['pkill', f'-{sig}', '-f', pattern], capture_output=True)
+            time.sleep(1)
 
     def build_ros_command(self, args):
         quoted_args = ' '.join(shlex.quote(arg) for arg in args)
@@ -196,26 +243,7 @@ class SystemManager(Node):
 
         if process_name_to_kill == 'navigation':
             self.disable_nav_motion_watchdog()
-
-        # Also kill any orphaned processes by name
-        if process_name_to_kill == 'slam':
-            slam_patterns = [
-                'mapping_all.launch.py',
-                'slam_toolbox',
-                'online_async',
-                'fastlio_mapping',
-                'livox_ros_driver2_node',
-                'pointcloud_to_laserscan_node',
-                'pointcloud_to_laserscan',
-                'body_to_lidar',
-            ]
-            for pattern in slam_patterns:
-                subprocess.run(['pkill', '-f', pattern], capture_output=True)
-        elif process_name_to_kill == 'navigation':
-            subprocess.run(['pkill', '-f', 'nav2_bringup'], capture_output=True)
-            subprocess.run(['pkill', '-f', 'navigation_launch'], capture_output=True)
-            subprocess.run(['pkill', '-f', 'robot_state_publisher'], capture_output=True)
-            subprocess.run(['pkill', '-f', 'gz sim'], capture_output=True)
+        self.cleanup_residual_processes()
 
     def enable_nav_motion_watchdog(self, stance):
         self.nav_motion_watchdog_active = True
@@ -415,43 +443,53 @@ class SystemManager(Node):
                 'ros2', 'run', 'nav2_map_server', 'map_saver_cli',
                 '-f', map_path,
                 '--ros-args',
-                '-p', 'save_map_timeout:=10.0',
+                '-p', 'save_map_timeout:=20.0',
                 '-p', 'map_subscribe_transient_local:=true',
             ]
-            result = subprocess.run(
-                self.build_ros_command(ros_args),
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            result = None
+            attempts = 2
+            last_error = ''
+            for attempt in range(1, attempts + 1):
+                result = subprocess.run(
+                    self.build_ros_command(ros_args),
+                    capture_output=True,
+                    text=True,
+                    timeout=45,
+                )
+                stderr = (result.stderr or '').strip()
+                stdout = (result.stdout or '').strip()
+                combined = '\n'.join(part for part in [stderr, stdout] if part).strip()
+                last_error = combined or f'rc={result.returncode}'
 
-            if result.returncode == 0:
+                if result.returncode == 0:
+                    break
+
+                if 'Failed to spin map subscription' in last_error and attempt < attempts:
+                    self.get_logger().warn(
+                        f'map_saver subscription was not ready on attempt {attempt}, retrying once...'
+                    )
+                    time.sleep(1.0)
+                    continue
+
+                break
+
+            if result and result.returncode == 0:
                 yaml_path = f'{map_path}.yaml'
                 pgm_path = f'{map_path}.pgm'
 
                 if os.path.exists(yaml_path) and os.path.exists(pgm_path):
-                    # Upload to server
                     try:
                         upload_base_url = self.resolve_map_upload_url()
-                        with open(yaml_path, 'r') as f:
-                            yaml_content = f.read()
-                        with open(pgm_path, 'rb') as f:
-                            pgm_content = base64.b64encode(f.read()).decode('utf-8')
-
-                        upload_data = {
-                            'name': map_name,
-                            'yaml': yaml_content,
-                            'pgm': pgm_content
-                        }
-                        upload_url = f'{upload_base_url}/api/maps/upload'
-                        self.get_logger().info(f'Uploading map to {upload_url}...')
-                        upload_resp = requests.post(upload_url, json=upload_data, timeout=30)
+                        map_list = self.build_map_list_payload()
+                        upload_url = f'{upload_base_url}/api/maps/list'
+                        self.get_logger().info(f'Uploading map list to {upload_url}...')
+                        upload_resp = requests.post(upload_url, json={'maps': map_list}, timeout=15)
                         if upload_resp.status_code == 200:
-                            self.get_logger().info('Map uploaded successfully')
+                            self.get_logger().info('Map list uploaded successfully')
                         else:
-                            self.get_logger().warn(f'Upload failed: {upload_resp.status_code} {upload_resp.text}')
+                            self.get_logger().warn(f'Map list upload failed: {upload_resp.status_code} {upload_resp.text}')
                     except Exception as upload_err:
-                        self.get_logger().warn(f'Failed to upload map: {upload_err}')
+                        self.get_logger().warn(f'Failed to upload map list: {upload_err}')
 
                     response.success = True
                     response.message = f'Map saved: {yaml_path}'
@@ -460,7 +498,7 @@ class SystemManager(Node):
                     response.message = 'Map files not found after save'
             else:
                 response.success = False
-                response.message = f'map_saver failed: {result.stderr}'
+                response.message = f'map_saver failed: {last_error}'
         except subprocess.TimeoutExpired:
             response.success = False
             response.message = 'Map save timed out'
@@ -469,6 +507,29 @@ class SystemManager(Node):
             response.message = f'Failed: {e}'
 
         return response
+
+    def build_map_list_payload(self):
+        maps = []
+        try:
+            for entry in sorted(os.listdir(self.maps_dir)):
+                if not entry.endswith('.yaml'):
+                    continue
+                map_name = entry[:-5]
+                yaml_path = os.path.join(self.maps_dir, entry)
+                pgm_path = os.path.join(self.maps_dir, f'{map_name}.pgm')
+                if not os.path.exists(pgm_path):
+                    continue
+
+                stats = os.stat(yaml_path)
+                maps.append({
+                    'name': map_name,
+                    'filename': entry,
+                    'path': yaml_path,
+                    'created': datetime.fromtimestamp(stats.st_mtime, tz=timezone.utc).isoformat(),
+                })
+        except Exception as exc:
+            self.get_logger().warn(f'Failed to build map list payload: {exc}')
+        return maps
 
     def resolve_map_upload_url(self):
         discovered_url = discover_server_url()
