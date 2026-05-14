@@ -10,19 +10,19 @@ shift $(( $# > 0 ? 1 : 0 )) || true
 if [ "$#" -gt 0 ]; then
   TOPICS=("$@")
 else
-  TOPICS=("/scan" "/tf" "/tf_static" "/map" "/plan")
+  TOPICS=("/scan_web" "/tf" "/tf_static" "/map_web" "/plan")
 fi
 
 TOPICS_JSON="["
 for topic in "${TOPICS[@]}"; do
   case "$topic" in
-    /scan|/scan_raw)
+    /scan_web|/scan_raw)
       type="sensor_msgs/msg/LaserScan"
       ;;
     /tf|/tf_static)
       type="tf2_msgs/msg/TFMessage"
       ;;
-    /map)
+    /map_web)
       type="nav_msgs/msg/OccupancyGrid"
       ;;
     /plan)
@@ -30,7 +30,7 @@ for topic in "${TOPICS[@]}"; do
       ;;
     *)
       echo "Unsupported topic type mapping for: $topic" >&2
-      echo "Supported topics: /scan /scan_raw /tf /tf_static /map /plan" >&2
+      echo "Supported topics: /scan /scan_web./tools/measure-topic-load.sh ws://192.168.1.58:9090 10
       exit 1
       ;;
   esac
